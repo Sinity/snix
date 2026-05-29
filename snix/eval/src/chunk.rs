@@ -1,6 +1,7 @@
 use crate::opcode::{CodeIdx, ConstantIdx, Op, OpArg};
 use crate::value::Value;
 use crate::{CoercionKind, SourceCode};
+use std::cell::Cell;
 use std::io::Write;
 
 /// Maximum size of a u64 encoded in the vu128 varint encoding.
@@ -38,6 +39,11 @@ pub struct Chunk {
     /// Index of the last operation (i.e. not data) written to the code vector.
     /// Some operations (e.g. jump patching) need to know this.
     last_op: usize,
+
+    /// Cached span index for O(1) amortized lookups.
+    /// The VM processes instructions sequentially, so the next lookup
+    /// almost always hits the same or next span.
+    span_cache: Cell<usize>,
 }
 
 impl Chunk {
@@ -136,22 +142,37 @@ impl Chunk {
     /// Retrieve the [codemap::Span] from which the instruction at
     /// `offset` was compiled.
     pub fn get_span(&self, offset: CodeIdx) -> codemap::Span {
+        let cache_idx = self.span_cache.get();
+
+        // Check if the cached span still covers this offset.
+        // Spans are sorted by start; span N covers [start_N, start_{N+1}).
+        let cached_covers = if cache_idx + 1 < self.spans.len() {
+            self.spans[cache_idx].start <= offset.0
+                && offset.0 < self.spans[cache_idx + 1].start
+        } else {
+            // Last span covers everything from its start to the end.
+            self.spans[cache_idx].start <= offset.0
+        };
+
+        if cached_covers {
+            return self.spans[cache_idx].span;
+        }
+
+        // Cache miss — sequential access typically lands here only
+        // once per span transition. Binary search and update the cache.
         let position = self
             .spans
             .binary_search_by(|span| span.start.cmp(&offset.0));
 
-        let span = match position {
-            Ok(index) => &self.spans[index],
-            Err(index) => {
-                if index == 0 {
-                    &self.spans[0]
-                } else {
-                    &self.spans[index - 1]
-                }
+        let index = match position {
+            Ok(i) => i,
+            Err(i) => {
+                if i == 0 { 0 } else { i - 1 }
             }
         };
 
-        span.span
+        self.span_cache.set(index);
+        self.spans[index].span
     }
 
     /// Write the disassembler representation of the operation at

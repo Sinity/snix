@@ -6,6 +6,7 @@ use snix_eval::{EvalIO, FileType, StdIO};
 use snix_store::nar::NarCalculationService;
 use std::{
     cell::RefCell,
+    collections::HashSet,
     env,
     ffi::{OsStr, OsString},
     io,
@@ -13,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tokio_util::io::SyncIoBridge;
-use tracing::{Level, Span, error, instrument, warn};
+use tracing::{Level, Span, debug, error, instrument};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use url::Url;
 
@@ -65,6 +66,11 @@ pub struct SnixStoreIO {
 
     // Paths known how to produce, by building or fetching.
     pub known_paths: RefCell<KnownPaths>,
+
+    // Cache of store path digests known to exist on the real filesystem
+    // (i.e. not managed by Snix).  Avoids redundant async lookups through
+    // PathInfoService → fetchers → derivations for every file access.
+    foreign_store_paths: RefCell<HashSet<[u8; 20]>>,
 }
 
 impl SnixStoreIO {
@@ -93,6 +99,7 @@ impl SnixStoreIO {
                 hashed_mirrors,
             ),
             known_paths: Default::default(),
+            foreign_store_paths: RefCell::new(HashSet::new()),
         }
     }
 
@@ -121,6 +128,12 @@ impl SnixStoreIO {
     where
         S: AsRef<str>,
     {
+        // If we already know this store path lives on the real filesystem
+        // (not managed by Snix), short-circuit the entire lookup chain.
+        if self.foreign_store_paths.borrow().contains(store_path.digest()) {
+            return Ok(None);
+        }
+
         // Find the root node for the store_path.
         // It asks the PathInfoService first, but in case there was a Derivation
         // produced that would build it, fall back to triggering the build.
@@ -144,6 +157,10 @@ impl SnixStoreIO {
             // it for things like <nixpkgs> pointing to a store path.
             // In the future, these things will (need to) have PathInfo.
             None => {
+                // Cache this digest so subsequent accesses skip the lookup.
+                self.foreign_store_paths
+                    .borrow_mut()
+                    .insert(*store_path.digest());
                 // The store path doesn't exist yet, so we need to fetch or build it.
                 // We check for fetches first, as we might have both native
                 // fetchers and FODs in KnownPaths, and prefer the former.
@@ -182,7 +199,9 @@ impl SnixStoreIO {
                                     known_paths.get_drv_by_drvpath(drv_path).unwrap().to_owned(),
                                 ),
                                 None => {
-                                    warn!(store_path=%store_path, "no drv found");
+                                    // StdIO will handle this — the store path
+                                    // is on the real filesystem, not managed by Snix.
+                                    debug!(store_path=%store_path, "store path not managed by Snix, delegating to StdIO");
                                     // let StdIO take over
                                     return Ok(None);
                                 }
