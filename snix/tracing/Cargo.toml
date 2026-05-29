@@ -9,7 +9,7 @@ clap = { workspace = true, optional = true, features = ["derive", "env"] }
 enumset = { version = "1.1.0", optional = true }
 tracing = { workspace = true, features = [
   "max_level_trace",
-  "release_max_level_debug",
+  "release_max_level_info",
 ] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing-indicatif.workspace = true

@@ -189,9 +189,10 @@ zstd = "0.13.2"
 
 # Optimize the release profile for runtime performance.
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
+panic = "abort"
 
 # Add a profile to all targets that enables release optimisations, but
 # retains debug symbols. This is great for use with
