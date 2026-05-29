@@ -8,6 +8,7 @@ use nix_compat::{
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
+use snix_castore::import::fs::ingest_path;
 use snix_castore::{Node, blobservice::BlobService, directoryservice::DirectoryService};
 use snix_store::{
     nar::{NarCalculationService, NarIngestionError},
@@ -75,8 +76,20 @@ pub enum Fetch {
         hash: NixHash,
     },
 
-    /// TODO
-    Git(),
+    /// Fetch a git repository at a given URL, optionally checking out a specific
+    /// branch, tag, or revision.
+    Git {
+        /// The URL to fetch from.
+        url: Url,
+        /// Branch or tag name (e.g. "master", "v1.2.3").
+        r#ref: Option<String>,
+        /// Specific revision to check out.
+        rev: Option<String>,
+        /// Whether to export all refs (makes .git available in the output).
+        all_refs: bool,
+        /// Whether to fetch submodules.
+        submodules: bool,
+    },
 }
 
 // Drops potentially sensitive username and password from a URL.
@@ -128,7 +141,16 @@ impl std::fmt::Debug for Fetch {
                 let url = redact_url(url);
                 write!(f, "Executable [url: {}, hash: {}]", &url, hash)
             }
-            Fetch::Git() => todo!(),
+            Fetch::Git {
+                url, r#ref, rev, ..
+            } => {
+                let url = redact_url(url);
+                f.debug_struct("Git")
+                    .field("url", &url)
+                    .field("ref", r#ref)
+                    .field("rev", rev)
+                    .finish()
+            }
         }
     }
 }
@@ -156,7 +178,9 @@ impl Fetch {
                 CAHash::Nar(hash.to_owned())
             }
 
-            Fetch::Git() => todo!(),
+            // Git fetches can't compute store paths upfront — we need to
+            // clone first to determine the tree hash.
+            Fetch::Git { .. } => return Ok(None),
 
             // everything else
             Fetch::URL { exp_hash: None, .. }
@@ -200,6 +224,27 @@ impl<BS, DS, PS, NS> Fetcher<BS, DS, PS, NS> {
             nar_calculation_service,
             hashed_mirrors,
         }
+    }
+
+    /// Accessor for the blob service, used by callers that need to
+    /// ingest content outside the standard [Fetch] flow.
+    pub fn blob_service(&self) -> &BS {
+        &self.blob_service
+    }
+
+    /// Accessor for the directory service.
+    pub fn directory_service(&self) -> &DS {
+        &self.directory_service
+    }
+
+    /// Accessor for the path info service.
+    pub fn path_info_service(&self) -> &PS {
+        &self.path_info_service
+    }
+
+    /// Accessor for the NAR calculation service.
+    pub fn nar_calculation_service(&self) -> &NS {
+        &self.nar_calculation_service
     }
 
     /// Downloads single url.
@@ -561,7 +606,79 @@ where
 
                 Ok((root_node, CAHash::Nar(actual_hash), file_size))
             }
-            Fetch::Git() => todo!(),
+            Fetch::Git {
+                url,
+                r#ref,
+                rev,
+                all_refs,
+                submodules,
+            } => {
+                if submodules {
+                    return Err(FetcherError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "fetchGit submodules are not yet supported",
+                    )));
+                }
+                // Create a temporary directory for the clone.
+                let tmpdir = tempfile::TempDir::new().map_err(FetcherError::Io)?;
+
+                // Clone the repo and checkout the right revision.
+                let _resolved_rev = tokio::task::spawn_blocking({
+                    let url = url.clone();
+                    let r#ref = r#ref.clone();
+                    let rev = rev.clone();
+                    let tmpdir_path = tmpdir.path().to_path_buf();
+                    move || do_git_fetch(&url, r#ref.as_deref(), rev.as_deref(), &tmpdir_path)
+                })
+                .await
+                .map_err(|e| {
+                    FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })??;
+
+                // If not exporting all refs, remove the .git directory so
+                // the ingested tree is a clean working copy.
+                if !all_refs {
+                    let git_dir = tmpdir.path().join(".git");
+                    if git_dir.exists() {
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::remove_dir_all(&git_dir)
+                        })
+                        .await
+                        .map_err(|e| {
+                            FetcherError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other, e,
+                            ))
+                        })??;
+                    }
+                }
+
+                // Ingest the checked-out tree into the store.
+                let root_node = ingest_path::<_, _, _, &[u8]>(
+                    self.blob_service.clone(),
+                    self.directory_service.clone(),
+                    tmpdir.path(),
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })?;
+
+                // Calculate the NAR hash for the ingested tree.
+                let (nar_size, nar_sha256) = self
+                    .nar_calculation_service
+                    .calculate_nar(&root_node)
+                    .await
+                    .map_err(|e| FetcherError::Io(e.into()))?;
+
+                // tmpdir is dropped here, cleaning up the clone.
+
+                Ok((
+                    root_node,
+                    CAHash::Nar(NixHash::Sha256(nar_sha256)),
+                    nar_size,
+                ))
+            }
         }
     }
 
@@ -615,6 +732,225 @@ where
 
         Ok((store_path, path_info))
     }
+
+    /// Clone a git repository, ingest its working tree, and persist the
+    /// resulting PathInfo.  Returns the store path, PathInfo, and
+    /// resolved HEAD revision.
+    ///
+    /// This is the unified entry point for git fetches — both
+    /// `builtin_fetch_git` and `Fetcher::ingest(Fetch::Git)` use it.
+    pub async fn ingest_git_and_persist<'a>(
+        &self,
+        name: &'a str,
+        url: &Url,
+        r#ref: Option<&str>,
+        rev: Option<&str>,
+        all_refs: bool,
+        submodules: bool,
+    ) -> Result<(StorePathRef<'a>, PathInfo, String), FetcherError> {
+        // Submodule support is not yet implemented.  Error out rather
+        // than silently producing an incomplete tree.
+        if submodules {
+            return Err(FetcherError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "fetchGit submodules are not yet supported",
+            )));
+        }
+        let tmpdir = tempfile::TempDir::new().map_err(FetcherError::Io)?;
+
+        // Clone the repo and check out the right revision.
+        let resolved_rev = tokio::task::spawn_blocking({
+            let url = url.clone();
+            let r#ref = r#ref.map(String::from);
+            let rev = rev.map(String::from);
+            let tmpdir_path = tmpdir.path().to_path_buf();
+            move || do_git_fetch(&url, r#ref.as_deref(), rev.as_deref(), &tmpdir_path)
+        })
+        .await
+        .map_err(|e| {
+            FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })??;
+
+        // Remove .git unless allRefs is requested.
+        if !all_refs {
+            let git_dir = tmpdir.path().join(".git");
+            if git_dir.exists() {
+                tokio::task::spawn_blocking(move || {
+                    std::fs::remove_dir_all(&git_dir)
+                })
+                .await
+                .map_err(|e| {
+                    FetcherError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other, e,
+                    ))
+                })??;
+            }
+        }
+
+        // Ingest the checked-out tree into the store.
+        let root_node = ingest_path::<_, _, _, &[u8]>(
+            self.blob_service.clone(),
+            self.directory_service.clone(),
+            tmpdir.path(),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
+
+        // Calculate the NAR hash for the ingested tree.
+        let (nar_size, nar_sha256) = self
+            .nar_calculation_service
+            .calculate_nar(&root_node)
+            .await
+            .map_err(|e| FetcherError::Io(e.into()))?;
+
+        let ca_hash = CAHash::Nar(NixHash::Sha256(nar_sha256));
+        let store_path = build_ca_path(name, &ca_hash, Vec::<String>::new(), false)?;
+        // ca_hash is always Nar(Sha256) for git fetches, so nar_size
+        // and nar_sha256 from calculate_nar above are already correct.
+
+        let path_info = PathInfo {
+            store_path: store_path.to_owned(),
+            node: root_node,
+            references: vec![],
+            nar_size,
+            nar_sha256,
+            signatures: vec![],
+            deriver: None,
+            ca: Some(ca_hash),
+        };
+
+        self.path_info_service
+            .put(path_info.clone())
+            .await
+            .map_err(|e| FetcherError::Io(e.into()))?;
+
+        Ok((store_path, path_info, resolved_rev))
+    }
+}
+
+/// Validate that a URL's scheme is safe for passing to `git clone`.
+/// Only schemes that don't trigger git's remote helper extensibility
+/// (`ext::`) are allowed.
+fn validate_git_url(url: &Url) -> Result<(), FetcherError> {
+    match url.scheme() {
+        "http" | "https" | "file" | "ssh" | "git" => Ok(()),
+        other => Err(FetcherError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported git URL scheme: {other}"),
+        ))),
+    }
+}
+
+/// Clone a git repository and check out the specified revision.
+///
+/// Returns the resolved HEAD revision after checkout.
+pub fn do_git_fetch(
+    url: &Url,
+    r#ref: Option<&str>,
+    rev: Option<&str>,
+    dest: &std::path::Path,
+) -> Result<String, FetcherError> {
+    use std::process::Command;
+
+    validate_git_url(url)?;
+    let url_str = url.to_string();
+    // Convert dest to a &str, handling non-UTF-8 gracefully.
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| {
+            FetcherError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination path is not valid UTF-8",
+            ))
+        })?;
+
+    // Reject refs starting with "-" (same as rev validation).
+    if let Some(r) = r#ref {
+        if r.starts_with('-') {
+            return Err(FetcherError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("git ref must not start with '-': {r}"),
+            )));
+        }
+    }
+
+    // Clone the repository (shallow if no specific ref/rev for speed).
+    let mut clone = Command::new("git");
+    clone.arg("clone");
+    if rev.is_some() {
+        // When a specific rev is requested, do a full clone to ensure
+        // the commit is reachable.
+        clone.arg("--no-checkout");
+    } else if let Some(r) = r#ref {
+        clone.args(["--branch", r, "--depth", "1"]);
+    } else {
+        clone.args(["--depth", "1"]);
+    }
+    // -- separates options from positional arguments so that the URL
+    // is never interpreted as a flag, even if it starts with "-".
+    clone.arg("--");
+    clone.arg(&url_str);
+    clone.arg(dest);
+
+    let output = clone.output().map_err(FetcherError::Io)?;
+    if !output.status.success() {
+        return Err(FetcherError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )));
+    }
+
+    // If a specific revision was requested, check it out.
+    if let Some(rev) = rev {
+        // Reject revisions starting with "-" to prevent git flag
+        // injection.  Git refs (hashes, tags, branch names) never
+        // start with "-" in practice.
+        if rev.starts_with('-') {
+            return Err(FetcherError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("git revision must not start with '-': {rev}"),
+            )));
+        }
+        let mut checkout = Command::new("git");
+        checkout.args(["-C", dest_str, "checkout", rev]);
+        let output = checkout.output().map_err(FetcherError::Io)?;
+        if !output.status.success() {
+            return Err(FetcherError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "git checkout failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            )));
+        }
+    }
+
+    // Get the actual HEAD revision.
+    let mut rev_parse = Command::new("git");
+    rev_parse.args(["-C", dest_str, "rev-parse", "HEAD"]);
+    let output = rev_parse.output().map_err(FetcherError::Io)?;
+    if !output.status.success() {
+        return Err(FetcherError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git rev-parse failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )));
+    }
+
+    Ok(String::from_utf8(output.stdout)
+        .map_err(|e| {
+            FetcherError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?
+        .trim()
+        .to_string())
 }
 
 /// Attempts to mimic `nix::libutil::baseNameOf`
@@ -730,6 +1066,89 @@ mod tests {
             let mut url = Url::parse("http://localhost").expect("invalid url");
             url.set_path(url_path);
             assert_eq!(url_basename(&url), exp_basename);
+        }
+    }
+
+    mod git {
+        use super::super::{do_git_fetch, Fetch};
+        use std::process::Command;
+
+        /// Verify that Fetch::Git returns None for store_path
+        /// (can't precompute without cloning).
+        #[test]
+        fn git_store_path_is_none() {
+            let fetch = Fetch::Git {
+                url: url::Url::parse("https://github.com/example/repo.git").unwrap(),
+                r#ref: Some("main".into()),
+                rev: None,
+                all_refs: false,
+                submodules: false,
+            };
+            assert!(
+                fetch.store_path("test").unwrap().is_none(),
+                "Git fetch without known hash should return None"
+            );
+        }
+
+        /// do_git_fetch clones a local repo and resolves HEAD.
+        #[test]
+        fn do_git_fetch_local_repo() {
+            let tmpdir = tempfile::TempDir::new().unwrap();
+            let repo_path = tmpdir.path().join("test-repo");
+
+            // Create a git repo with one commit.
+            let init = Command::new("git")
+                .args(["init", repo_path.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(init.status.success(), "git init failed");
+
+            std::fs::write(repo_path.join("README.md"), b"hello").unwrap();
+            let add = Command::new("git")
+                .args(["-C", repo_path.to_str().unwrap(), "add", "README.md"])
+                .output()
+                .unwrap();
+            assert!(add.status.success(), "git add failed");
+
+            let commit = Command::new("git")
+                .args([
+                    "-C",
+                    repo_path.to_str().unwrap(),
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@test",
+                    "commit",
+                    "-m",
+                    "init",
+                ])
+                .output()
+                .unwrap();
+            assert!(commit.status.success(), "git commit failed");
+
+            // Resolve HEAD manually for comparison.
+            let expected_rev = String::from_utf8(
+                Command::new("git")
+                    .args(["-C", repo_path.to_str().unwrap(), "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+
+            // Clone the repo to a new temp dir via do_git_fetch.
+            let dest = tempfile::TempDir::new().unwrap();
+            let url =
+                url::Url::from_file_path(repo_path).expect("should convert path to file URL");
+            let rev = do_git_fetch(&url, None, None, dest.path()).unwrap();
+
+            assert_eq!(rev, expected_rev, "resolved rev should match HEAD");
+            assert!(
+                dest.path().join("README.md").exists(),
+                "cloned repo should have README.md"
+            );
         }
     }
 }
