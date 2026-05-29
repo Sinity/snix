@@ -10,7 +10,7 @@ use genawaiter::rc::Gen;
 use std::rc::Weak;
 
 use crate::{
-    ErrorKind, SourceCode, Value,
+    ErrorKind, FileType, SourceCode, Value,
     builtins::coerce_value_to_path,
     generators::pin_generator,
     try_cek_to_value,
@@ -27,7 +27,13 @@ async fn import_impl(
     // TODO(sterni): canon_path()?
     let mut path = try_cek_to_value!(coerce_value_to_path(&co, args.pop().unwrap()).await?);
 
-    if path.is_dir() {
+    // Use the IO handle to check whether the path is a directory, so
+    // that paths inside fetched store content (which don't exist on
+    // the real filesystem) are handled correctly.
+    if matches!(
+        generators::request_read_file_type(&co, path.clone()).await,
+        FileType::Directory
+    ) {
         path.push("default.nix");
     }
 

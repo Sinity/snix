@@ -629,18 +629,34 @@ where
                 Op::AttrsSelect => lifted_pop! {
                     self(key, attrs) => {
                         let key = key.to_str().with_span(&frame, self)?;
-                        let attrs = attrs.to_attrs().with_span(&frame, self)?;
 
-                        match attrs.select(&key) {
-                            Some(value) => self.stack.push(value.clone()),
-
-                            None => {
-                                return frame.error(
-                                    self,
-                                    ErrorKind::AttributeNotFound {
-                                        name: key.to_str_lossy().into_owned()
-                                    },
-                                );
+                        match attrs {
+                            // Path attribute access: path.lib → path/lib.
+                            // Only applies to directory paths; file paths
+                            // fall through to the type error, matching CppNix.
+                            Value::Path(p) if self
+                                .io_handle
+                                .as_ref()
+                                .file_type(&p)
+                                .is_ok_and(|ft| matches!(ft, crate::io::FileType::Directory)) =>
+                            {
+                                self.stack.push(Value::Path(Box::new(
+                                    p.join(key.to_str_lossy().as_ref()),
+                                )));
+                            }
+                            _ => {
+                                let attrs = attrs.to_attrs().with_span(&frame, self)?;
+                                match attrs.select(&key) {
+                                    Some(value) => self.stack.push(value.clone()),
+                                    None => {
+                                        return frame.error(
+                                            self,
+                                            ErrorKind::AttributeNotFound {
+                                                name: key.to_str_lossy().into_owned(),
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -689,6 +705,17 @@ where
                             Some(value) => value.clone(),
                             None => Value::AttrNotFound,
                         },
+                        // Path attribute access: path.lib → path/lib
+                        // Only directories, matching CppNix semantics.
+                        Value::Path(p)
+                            if self
+                                .io_handle
+                                .as_ref()
+                                .file_type(&p)
+                                .is_ok_and(|ft| matches!(ft, crate::io::FileType::Directory)) =>
+                        {
+                            Value::Path(Box::new(p.join(key.to_str_lossy().as_ref())))
+                        }
 
                         _ => Value::AttrNotFound,
                     };
@@ -1358,6 +1385,11 @@ async fn add_values(co: GenCo, a: Value, b: Value) -> Result<Value, ErrorKind> {
     // What we try to do is solely determined by the type of the first value!
     let result = match (a, b) {
         (Value::Path(p), v) => {
+            // Use OsString concatenation without extra separator.
+            // Nix Path + String is raw concatenation: /bin + "bar" → /binbar.
+            // PathBuf::push is NOT used because it treats absolute-path
+            // arguments as replacements (push("/lib") on "/nix/store/hash"
+            // would yield "/lib" instead of "/nix/store/hash/lib").
             let mut path = p.into_os_string();
             match generators::request_string_coerce(
                 &co,
@@ -1381,7 +1413,7 @@ async fn add_values(co: GenCo, a: Value, b: Value) -> Result<Value, ErrorKind> {
             {
                 Ok(vs) => {
                     path.push(vs.to_os_str()?);
-                    crate::value::canon_path(PathBuf::from(path)).into()
+                    crate::value::canon_path(std::path::PathBuf::from(path)).into()
                 }
                 Err(c) => Value::Catchable(Box::new(c)),
             }
