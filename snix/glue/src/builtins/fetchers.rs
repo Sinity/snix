@@ -220,7 +220,7 @@ pub(crate) mod fetcher_builtins {
             let url_str = String::from_utf8(url_str.as_bytes().to_vec())
                 .map_err(|_| ErrorKind::Utf8)?;
             let url =
-                Url::parse(&url_str).map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                Url::parse(&url_str).map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
             (url, None, None, None, false, false)
         } else {
             let attrs = args.to_attrs().map_err(|_| ErrorKind::TypeError {
@@ -231,7 +231,7 @@ pub(crate) mod fetcher_builtins {
             let url_str = try_cek_to_value!(select_string(&co, &attrs, "url").await?)
                 .ok_or_else(|| ErrorKind::AttributeNotFound { name: "url".into() })?;
             let url =
-                Url::parse(&url_str).map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                Url::parse(&url_str).map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
             let r#ref = try_cek_to_value!(select_string(&co, &attrs, "ref").await?);
             let rev = try_cek_to_value!(select_string(&co, &attrs, "rev").await?);
             let name = try_cek_to_value!(select_string(&co, &attrs, "name").await?);
@@ -271,7 +271,7 @@ pub(crate) mod fetcher_builtins {
                 )
                 .await
             })
-            .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+            .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
 
         // Build the attrset matching CppNix's fetchGit return value.
         let out_path = store_path.to_absolute_path();
@@ -291,7 +291,7 @@ pub(crate) mod fetcher_builtins {
         attrs.insert("revCount".into(), Value::Integer(0));
         attrs.insert("submodules".into(), Value::Bool(submodules));
 
-        Ok(Value::Attrs(Box::new(NixAttrs::from_iter(attrs))))
+        Ok(Value::Attrs(NixAttrs::from_iter(attrs)))
     }
 
     // FUTUREWORK: make it a feature flag once #64 is implemented
@@ -424,7 +424,7 @@ pub(crate) mod fetcher_builtins {
                 let enc = |s: &str| -> Result<String, ErrorKind> {
                     for c in s.chars() {
                         if matches!(c, '{' | '}' | '|' | '^' | ' ' | '\\' | '<' | '>') {
-                            return Err(ErrorKind::SnixError(Rc::new(
+                            return Err(ErrorKind::SnixError(Arc::new(
                                 std::io::Error::new(
                                     std::io::ErrorKind::InvalidInput,
                                     format!("unsupported character '{c}' in git ref '{s}'"),
@@ -452,7 +452,7 @@ pub(crate) mod fetcher_builtins {
                         enc(&tag_or_rev)?
                     ))
                 }
-                .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
 
                 let name = name.unwrap_or_else(|| "source".to_owned());
                 let nar_hash = try_cek_to_value!(select_string(&co, &attrs, "narHash").await?);
@@ -474,7 +474,7 @@ pub(crate) mod fetcher_builtins {
                         name: "url".into(),
                     })?;
                 let url = Url::parse(&url_str)
-                    .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                    .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
                 let r#ref = try_cek_to_value!(select_string(&co, &attrs, "ref").await?);
                 let rev = try_cek_to_value!(select_string(&co, &attrs, "rev").await?);
                 let name = try_cek_to_value!(select_string(&co, &attrs, "name").await?);
@@ -506,7 +506,7 @@ pub(crate) mod fetcher_builtins {
                         )
                         .await
                     })
-                    .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                    .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
 
                 let out_path = store_path.to_absolute_path();
                 let short_rev: String = resolved_rev.chars().take(7).collect();
@@ -522,7 +522,7 @@ pub(crate) mod fetcher_builtins {
                 result.insert("revCount".into(), Value::Integer(0));
                 result.insert("submodules".into(), Value::Bool(submodules));
 
-                Ok(Value::Attrs(Box::new(NixAttrs::from_iter(result))))
+                Ok(Value::Attrs(NixAttrs::from_iter(result)))
             }
 
             "tarball" => {
@@ -531,7 +531,7 @@ pub(crate) mod fetcher_builtins {
                         name: "url".into(),
                     })?;
                 let url = Url::parse(&url_str)
-                    .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                    .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
                 let name = try_cek_to_value!(select_string(&co, &attrs, "name").await?);
                 let name = name.unwrap_or_else(|| "source".to_owned());
                 let nar_hash_raw = try_cek_to_value!(select_string(&co, &attrs, "narHash").await?);
@@ -554,7 +554,7 @@ pub(crate) mod fetcher_builtins {
                 if let Some(hash) = nar_hash_raw {
                     attrs.insert("narHash".into(), Value::from(hash));
                 }
-                Ok(Value::Attrs(Box::new(NixAttrs::from_iter(attrs))))
+                Ok(Value::Attrs(NixAttrs::from_iter(attrs)))
             }
 
             "file" | "url" => {
@@ -563,7 +563,7 @@ pub(crate) mod fetcher_builtins {
                         name: "url".into(),
                     })?;
                 let url = Url::parse(&url_str)
-                    .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                    .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
                 let name = try_cek_to_value!(select_string(&co, &attrs, "name").await?);
                 let name = name.unwrap_or_else(|| default_fetch_name(&url));
                 let sha256_raw =
@@ -590,7 +590,7 @@ pub(crate) mod fetcher_builtins {
                 if let Some(hash) = sha256_raw {
                     attrs.insert("narHash".into(), Value::from(hash));
                 }
-                Ok(Value::Attrs(Box::new(NixAttrs::from_iter(attrs))))
+                Ok(Value::Attrs(NixAttrs::from_iter(attrs)))
             }
 
             "path" => {
@@ -605,7 +605,7 @@ pub(crate) mod fetcher_builtins {
                 let p = std::path::Path::new(&path_str);
                 let imported = state
                     .import_path(p)
-                    .map_err(|e| ErrorKind::SnixError(Rc::new(e)))?;
+                    .map_err(|e| ErrorKind::SnixError(Arc::new(e)))?;
 
                 let mut attrs: BTreeMap<String, Value> = BTreeMap::new();
                 attrs.insert(
@@ -621,7 +621,7 @@ pub(crate) mod fetcher_builtins {
                 if let Some(h) = nar_hash_str {
                     attrs.insert("narHash".into(), Value::from(h));
                 }
-                Ok(Value::Attrs(Box::new(NixAttrs::from_iter(attrs))))
+                Ok(Value::Attrs(NixAttrs::from_iter(attrs)))
             }
 
             _ => Err(ErrorKind::NotImplemented(

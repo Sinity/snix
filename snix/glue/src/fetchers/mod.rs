@@ -669,7 +669,7 @@ where
                     .nar_calculation_service
                     .calculate_nar(&root_node)
                     .await
-                    .map_err(|e| FetcherError::Io(e.into()))?;
+                    .map_err(|e| FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
                 // tmpdir is dropped here, cleaning up the clone.
 
@@ -804,7 +804,7 @@ where
             .nar_calculation_service
             .calculate_nar(&root_node)
             .await
-            .map_err(|e| FetcherError::Io(e.into()))?;
+            .map_err(|e| FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let ca_hash = CAHash::Nar(NixHash::Sha256(nar_sha256));
         let store_path = build_ca_path(name, &ca_hash, Vec::<String>::new(), false)?;
@@ -825,7 +825,7 @@ where
         self.path_info_service
             .put(path_info.clone())
             .await
-            .map_err(|e| FetcherError::Io(e.into()))?;
+            .map_err(|e| FetcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok((store_path, path_info, resolved_rev))
     }

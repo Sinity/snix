@@ -19,22 +19,23 @@ mod optimiser;
 mod scope;
 
 use codemap::Span;
-use rnix::ast::{self, AstToken};
+use rnix::ast::{self, AstToken, InterpolPart, PathContent};
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
-use crate::CoercionKind;
 use crate::SourceCode;
 use crate::chunk::Chunk;
-use crate::errors::{CatchableErrorKind, Error, ErrorKind, EvalResult};
-use crate::observer::CompilerObserver;
+use crate::errors::{Error, ErrorKind, EvalResult};
+use crate::observer::{CompilerObserver, OptionalCompilerObserver};
 use crate::opcode::{CodeIdx, Op, Position, UpvalueIdx};
 use crate::spans::ToSpan;
+use crate::upvalues::UpvalueData;
 use crate::value::{Closure, Formals, Lambda, NixAttrs, Thunk, Value};
 use crate::warnings::{EvalWarning, WarningKind};
+use crate::{CoercionKind, NixString};
 
 use self::scope::{LocalIdx, LocalPosition, Scope, Upvalue, UpvalueKind};
 
@@ -166,7 +167,7 @@ pub struct Compiler<'source, 'observer> {
 
     /// Carry an observer for the compilation process, which is called
     /// whenever a chunk is emitted.
-    observer: &'observer mut dyn CompilerObserver,
+    observer: OptionalCompilerObserver<'observer>,
 
     /// Carry a count of nested scopes which have requested the
     /// compiler not to emit anything. This used for compiling dead
@@ -188,7 +189,7 @@ impl<'source, 'observer> Compiler<'source, 'observer> {
         env: Option<&FxHashMap<SmolStr, Value>>,
         source: &'source SourceCode,
         file: &'source codemap::File,
-        observer: &'observer mut dyn CompilerObserver,
+        observer: OptionalCompilerObserver<'observer>,
     ) -> EvalResult<Self> {
         let mut root_dir = match location {
             Some(dir) if cfg!(target_arch = "wasm32") || dir.is_absolute() => Ok(dir),
@@ -213,17 +214,7 @@ impl<'source, 'observer> Compiler<'source, 'observer> {
         // If the path passed from the caller points to a file, the
         // filename itself needs to be truncated as this must point to a
         // directory.
-        //
-        // Use a heuristic rather than Path::is_file() because the file
-        // may reside inside a store path served by the IO handle rather
-        // than on the real filesystem (e.g. when importing a file from
-        // within a fetched tarball).  All Nix source files end with
-        // ".nix", and the import builtin guarantees that the location it
-        // passes here is a file path (it appends default.nix for
-        // directories).
-        if root_dir.is_file()
-            || root_dir.extension().is_some_and(|ext| ext == "nix")
-        {
+        if root_dir.is_file() {
             root_dir.pop();
         }
 
@@ -320,6 +311,34 @@ impl Compiler<'_, '_> {
         self.push_op(Op::Constant, node);
         self.push_uvarint(idx.0 as u64);
     }
+
+    /// Emit bytecode for path interpolation parts in reverse order.
+    /// Literals become string constants, interpolations are compiled
+    /// and coerced to strings.
+    pub(super) fn emit_path_ipol_parts<T: ToSpan>(
+        &mut self,
+        slot: LocalIdx,
+        node: &T,
+        parts: impl DoubleEndedIterator<Item = InterpolPart<PathContent>>,
+    ) {
+        for part in parts.rev() {
+            match part {
+                InterpolPart::Interpolation(ipol) => {
+                    self.compile(slot, ipol.expr().unwrap());
+                    self.push_op(Op::CoerceToString, &ipol);
+                    let encoded: u8 = CoercionKind {
+                        strong: false,
+                        import_paths: true,
+                    }
+                    .into();
+                    self.push_u8(encoded);
+                }
+                InterpolPart::Literal(content) => {
+                    self.emit_constant(Value::String(content.text().into()), node);
+                }
+            }
+        }
+    }
 }
 
 // Actual code-emitting AST traversal methods.
@@ -329,7 +348,10 @@ impl Compiler<'_, '_> {
 
         match &expr {
             ast::Expr::Literal(literal) => self.compile_literal(literal),
-            ast::Expr::Path(path) => self.compile_path(slot, path),
+            ast::Expr::PathAbs(path) => self.compile_abs_path(slot, path),
+            ast::Expr::PathHome(path) => self.compile_home_path(slot, path),
+            ast::Expr::PathRel(path) => self.compile_rel_path(slot, path),
+            ast::Expr::PathSearch(path) => self.compile_search_path(slot, path),
             ast::Expr::Str(s) => self.compile_str(slot, s),
 
             ast::Expr::UnaryOp(op) => self.thunk(slot, op, move |c, s| c.compile_unary_op(s, op)),
@@ -380,6 +402,8 @@ impl Compiler<'_, '_> {
                 c.compile_legacy_let(s, legacy_let)
             }),
 
+            ast::Expr::CurPos(curpos) => self.compile_cur_pos(curpos),
+
             ast::Expr::Root(_) => unreachable!("there cannot be more than one root"),
             ast::Expr::Error(_) => unreachable!("compile is only called on validated trees"),
         }
@@ -414,121 +438,87 @@ impl Compiler<'_, '_> {
         self.emit_constant(value, node);
     }
 
-    fn compile_path(&mut self, slot: LocalIdx, node: &ast::Path) {
-        // TODO(tazjin): placeholder implementation while waiting for
-        // https://github.com/nix-community/rnix-parser/pull/96
+    fn compile_abs_path(&mut self, slot: LocalIdx, node: &ast::PathAbs) {
+        let parts = node.parts();
 
-        // Check for antiquotation (path interpolation like ./${name}).
-        let parts: Vec<_> = node.parts().collect();
-        let has_interpolation = parts
-            .iter()
-            .any(|p| matches!(p, ast::InterpolPart::Interpolation(_)));
-
-        if has_interpolation {
-            // Compile path interpolation as a thunk that builds the
-            // relative path string with Op::Interpolate (which works
-            // inside thunks), then joins with the base path via a single
-            // Op::Add.  Uses Op::Interpolate instead of multiple
-            // Op::Add calls because Op::Add creates generator frames
-            // that conflict with thunk evaluation.
-            let root_dir = self.root_dir.clone();
-            // Absolute interpolated paths (e.g. /${name}) must use "/"
-            // as the base, not the source file's root_dir.
-            let raw_path = node.to_string();
-            let base_path = if raw_path.starts_with('/') {
-                std::path::PathBuf::from("/")
-            } else {
-                crate::value::canon_path(root_dir)
-            };
-            return self.thunk(slot, node, move |c, s| {
-                // Push base path as Path first (will be `a` for Op::Add).
-                c.emit_constant(Value::Path(Box::new(base_path)), node);
-
-                // Build the relative path string from parts in reverse
-                // (Op::Interpolate expects items in reverse order).
-                for part in parts.iter().rev() {
-                    let part_node = node.clone();
-                    match part {
-                        ast::InterpolPart::Interpolation(ipol) => {
-                            // expr() is None only for degenerate/error-recovery
-                            // AST nodes; skip rather than panicking.
-                            let Some(expr) = ipol.expr() else { continue; };
-                            c.compile(s, expr);
-                            c.push_op(Op::CoerceToString, &part_node);
-                            let encoded: u8 = CoercionKind {
-                                strong: false,
-                                import_paths: true,
-                            }
-                            .into();
-                            c.push_u8(encoded);
-                        }
-                        ast::InterpolPart::Literal(lit) => {
-                            let lit_str = lit.to_string();
-                            // "./" → "/" (root_dir is the dot, slash is separator)
-                            let content = if lit_str.starts_with("./") {
-                                lit_str[1..].to_string()
-                            } else {
-                                lit_str
-                            };
-                            c.emit_constant(Value::from(content), &part_node);
-                        }
-                    }
-                }
-
-                // Join all string parts with Op::Interpolate.
-                // Works inside thunks (unlike Op::Add via generators).
-                if parts.len() > 1 {
-                    c.push_op(Op::Interpolate, node);
-                    c.push_uvarint(parts.len() as u64);
-                }
-
-                // Stack: [Path(root_dir), String(relative)].
-                // Single Op::Add: Path + String → raw concat → canon_path → Path.
-                c.push_op(Op::Add, node);
+        if is_interpolated_path(&parts) {
+            self.thunk(slot, node, move |c, s| {
+                let len = parts.len();
+                c.emit_path_ipol_parts(s, node, parts.into_iter());
+                c.push_op(Op::InterpolatePath, node);
+                c.push_uvarint(len as u64);
             });
-        }
-
-        let raw_path = node.to_string();
-        let path = if raw_path.starts_with('/') {
-            Path::new(&raw_path).to_owned()
-        } else if raw_path.starts_with('~') {
-            // We assume that home paths start with ~/ or fail to parse
-            // TODO: this should be checked using a parse-fail test.
-            debug_assert!(raw_path.len() > 2 && raw_path.starts_with("~/"));
-
-            let home_relative_path = &raw_path[2..(raw_path.len())];
-            self.emit_constant(
-                Value::UnresolvedPath(Box::new(home_relative_path.into())),
-                node,
-            );
-            self.push_op(Op::ResolveHomePath, node);
             return;
-        } else if raw_path.starts_with('<') {
-            // TODO: decide what to do with findFile
-            if raw_path.len() == 2 {
-                return self.emit_constant(
-                    Value::Catchable(Box::new(CatchableErrorKind::NixPathResolution(
-                        "Empty <> path not allowed".into(),
-                    ))),
-                    node,
-                );
-            }
-            let path = &raw_path[1..(raw_path.len() - 1)];
-            // Make a thunk to resolve the path (without using `findFile`, at least for now?)
-            return self.thunk(slot, node, move |c, _| {
-                c.emit_constant(Value::UnresolvedPath(Box::new(path.into())), node);
-                c.push_op(Op::FindFile, node);
-            });
-        } else {
-            let mut buf = self.root_dir.clone();
-            buf.push(&raw_path);
-            buf
-        };
+        }
 
         // TODO: Use https://github.com/rust-lang/rfcs/issues/2208
         // once it is available
+        let path = PathBuf::from(node.to_string());
         let value = Value::Path(Box::new(crate::value::canon_path(path)));
         self.emit_constant(value, node);
+    }
+
+    fn compile_home_path(&mut self, slot: LocalIdx, node: &ast::PathHome) {
+        let parts = node.parts();
+        let home_subpath = match &parts[0] {
+            ast::InterpolPart::Literal(part) => &part.text()[2..].to_string(),
+            _ => {
+                // It can't because it always starts with `~/` and rnix
+                // returns it as a literal
+                unreachable!("a home path can't start with interpolation")
+            }
+        };
+
+        if is_interpolated_path(&parts) {
+            self.thunk(slot, node, move |c, s| {
+                let len = parts.len();
+                c.emit_path_ipol_parts(s, node, parts.into_iter().skip(1));
+                c.emit_constant(Value::UnresolvedPath(Box::new(home_subpath.into())), node);
+                c.push_op(Op::ResolveHomePath, node);
+
+                c.push_op(Op::InterpolatePath, node);
+                c.push_uvarint(len as u64);
+            });
+            return;
+        }
+
+        self.emit_constant(Value::UnresolvedPath(Box::new(home_subpath.into())), node);
+        self.push_op(Op::ResolveHomePath, node);
+    }
+
+    fn compile_rel_path(&mut self, slot: LocalIdx, node: &ast::PathRel) {
+        let parts = node.parts();
+        let abs = match &parts[0] {
+            ast::InterpolPart::Literal(part) => self.root_dir.join(part.text()),
+            _ => {
+                unreachable!("a relative path can't start with interpolation");
+            }
+        };
+
+        if is_interpolated_path(&parts) {
+            self.thunk(slot, node, move |c, s| {
+                let len = parts.len();
+                c.emit_path_ipol_parts(s, node, parts.into_iter().skip(1));
+                c.emit_constant(Value::Path(abs.into()), node);
+
+                c.push_op(Op::InterpolatePath, node);
+                c.push_uvarint(len as u64);
+            });
+            return;
+        }
+
+        let value = Value::Path(Box::new(crate::value::canon_path(abs)));
+        self.emit_constant(value, node);
+    }
+
+    fn compile_search_path(&mut self, slot: LocalIdx, node: &ast::PathSearch) {
+        let raw_path = node.to_string();
+        let path = &raw_path[1..(raw_path.len() - 1)];
+        // Make a thunk to resolve the path (without using `findFile`, at least for now?)
+        self.thunk(slot, node, move |c, _| {
+            c.emit_constant(Value::UnresolvedPath(Box::new(path.into())), node);
+            c.push_op(Op::FindFile, node);
+        });
     }
 
     /// Helper that compiles the given string parts strictly. The caller
@@ -608,15 +598,24 @@ impl Compiler<'_, '_> {
     fn compile_binop(&mut self, slot: LocalIdx, op: &ast::BinOp) {
         use ast::BinOpKind;
 
-        // Short-circuiting and other strange operators, which are
-        // under the same node type as NODE_BIN_OP, but need to be
-        // handled separately (i.e. before compiling the expressions
-        // used for standard binary operators).
-
         match op.operator().unwrap() {
+            // Short-circuiting and other strange operators, which are
+            // under the same node type as NODE_BIN_OP, but need to be
+            // handled separately (i.e. before compiling the expressions
+            // used for standard binary operators).
             BinOpKind::And => return self.compile_and(slot, op),
             BinOpKind::Or => return self.compile_or(slot, op),
             BinOpKind::Implication => return self.compile_implication(slot, op),
+
+            // Pipe operators. Any introduction should be properly
+            // feature-flagged, due to its experimental status.
+            BinOpKind::PipeRight | BinOpKind::PipeLeft => {
+                return self.emit_error(
+                    op,
+                    ErrorKind::NotImplemented("pipe operators not implemented"),
+                );
+            }
+
             _ => {}
         };
 
@@ -641,14 +640,15 @@ impl Compiler<'_, '_> {
             BinOpKind::More => self.push_op(Op::More, op),
             BinOpKind::MoreOrEq => self.push_op(Op::MoreOrEq, op),
             BinOpKind::Concat => self.push_op(Op::Concat, op),
-
             BinOpKind::NotEqual => {
                 self.push_op(Op::Equal, op);
                 self.push_op(Op::Invert, op)
             }
-
-            // Handled by separate branch above.
-            BinOpKind::And | BinOpKind::Implication | BinOpKind::Or => {
+            BinOpKind::And
+            | BinOpKind::Implication
+            | BinOpKind::Or
+            | BinOpKind::PipeRight
+            | BinOpKind::PipeLeft => {
                 unreachable!()
             }
         };
@@ -1056,7 +1056,7 @@ impl Compiler<'_, '_> {
     ///
     /// These patterns are treated as a special case of locals binding
     /// where the attribute set itself is placed on the first stack
-    /// slot of the call frame (either as a phantom, or named in case
+    /// slot of the bytecode frame (either as a phantom, or named in case
     /// of an `@` binding), and the function call sets up the rest of
     /// the stack as if the parameters were rewritten into a `let`
     /// binding.
@@ -1430,11 +1430,8 @@ impl Compiler<'_, '_> {
     ) {
         // Push the count of arguments to be expected, with one bit set to
         // indicate whether the with stack needs to be captured.
-        let mut count = (upvalues.len() as u64) << 1;
-        if capture_with {
-            count |= 1;
-        }
-        self.push_uvarint(count);
+        let data = UpvalueData::new(upvalues.len(), capture_with);
+        self.push_uvarint(data.into_raw());
 
         for upvalue in upvalues {
             match upvalue.kind {
@@ -1461,6 +1458,28 @@ impl Compiler<'_, '_> {
                 }
             };
         }
+    }
+
+    pub fn compile_cur_pos(&mut self, node: &ast::CurPos) {
+        let value = match self.file.name() {
+            crate::REPL_LOCATION => Value::Null,
+            _ => {
+                let span = self.span_for(node);
+                let pos = self.file.find_line_col(span.low());
+                let abs_path = std::fs::canonicalize(self.file.name())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let attrs = NixAttrs::from_iter([
+                    ("line", Value::Integer((pos.line + 1) as i64)),
+                    ("column", Value::Integer((pos.column + 1) as i64)),
+                    ("file", Value::String(NixString::from(abs_path))),
+                ]);
+                Value::Attrs(attrs)
+            }
+        };
+
+        self.emit_constant(value, node);
     }
 
     /// Emit the literal string value of an identifier. Required for
@@ -1600,6 +1619,13 @@ fn expr_static_attr_str(node: &ast::Attr) -> Option<SmolStr> {
     }
 }
 
+/// Check whether a path contains any interpolated expressions.
+fn is_interpolated_path(parts: &[InterpolPart<PathContent>]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, ast::InterpolPart::Interpolation(_)))
+}
+
 /// Create a delayed source-only builtin compilation, for a builtin
 /// which is written in Nix code.
 ///
@@ -1636,7 +1662,7 @@ fn compile_src_builtin(
             None,
             &source,
             &file,
-            &mut crate::observer::NoOpObserver {},
+            Default::default(),
         )
         .map_err(|e| ErrorKind::NativeError {
             gen_type: "derivation",
@@ -1740,7 +1766,7 @@ pub fn compile(
     env: Option<&FxHashMap<SmolStr, Value>>,
     source: &SourceCode,
     file: &codemap::File,
-    observer: &mut dyn CompilerObserver,
+    observer: OptionalCompilerObserver<'_>,
 ) -> EvalResult<CompilationOutput> {
     let mut c = Compiler::new(location, globals.clone(), env, source, file, observer)?;
 
