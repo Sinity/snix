@@ -502,6 +502,28 @@ impl EvalIO for SnixStoreIO {
 
     #[instrument(skip(self), ret(level = Level::TRACE), err)]
     fn import_path(&self, path: &std::path::Path) -> io::Result<std::path::PathBuf> {
+        // If the path is already a store path whose content is tracked
+        // by the PathInfoService, return the store path directly without
+        // walking the real filesystem (which doesn't have /nix/store
+        // when using in-memory or non-FUSE backends).
+        if let Ok((store_path, sub_path)) =
+            nix_compat::store_path::StorePathRef::from_absolute_path_full(path)
+        {
+            // Only short-circuit when the path is the store path root
+            // (no sub-path).  A path like /nix/store/hash-name/lib/file
+            // must go through import_path_as_nar_ca; returning just the
+            // root store path would be incorrect.
+            if sub_path.as_os_str().is_empty()
+                && self
+                    .tokio_handle
+                    .block_on(self.path_info_service.get(*store_path.digest()))
+                    .map_err(std::io::Error::other)?
+                    .is_some()
+            {
+                return Ok(store_path.to_absolute_path().into());
+            }
+        }
+
         let path_info = self.tokio_handle.block_on({
             snix_store::import::import_path_as_nar_ca(
                 path,

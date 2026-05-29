@@ -32,11 +32,21 @@ where
     }
 
     fn import_path(&self, path: &Path) -> io::Result<PathBuf> {
+        if path.starts_with("/__corepkgs__") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "importing from __corepkgs__ is not supported",
+            ));
+        }
         self.actual.as_ref().import_path(path)
     }
 
     fn path_exists(&self, path: &Path) -> io::Result<bool> {
-        if path.starts_with("/__corepkgs__") {
+        // Only report existence for the known virtual __corepkgs__ paths.
+        if path == std::path::Path::new("/__corepkgs__")
+            || path == std::path::Path::new("/__corepkgs__/")
+            || path == std::path::Path::new("/__corepkgs__/fetchurl.nix")
+        {
             return Ok(true);
         }
 
@@ -60,10 +70,26 @@ where
     }
 
     fn file_type(&self, path: &Path) -> io::Result<FileType> {
+        if path == std::path::Path::new("/__corepkgs__")
+            || path == std::path::Path::new("/__corepkgs__/")
+        {
+            return Ok(FileType::Directory);
+        }
+        if path == std::path::Path::new("/__corepkgs__/fetchurl.nix") {
+            return Ok(FileType::Regular);
+        }
         self.actual.as_ref().file_type(path)
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<(bytes::Bytes, FileType)>> {
+        if path == std::path::Path::new("/__corepkgs__")
+            || path == std::path::Path::new("/__corepkgs__/")
+        {
+            return Ok(vec![(
+                bytes::Bytes::from_static(b"fetchurl.nix"),
+                FileType::Regular,
+            )]);
+        }
         self.actual.as_ref().read_dir(path)
     }
 
